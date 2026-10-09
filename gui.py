@@ -49,6 +49,7 @@ import auth
 import context_budget
 import image_gen
 import inputbar
+import memory
 import persona
 import speech
 import tools
@@ -565,6 +566,96 @@ class _PwRecordStream:
         return False
 
 
+def _system_prompt_with_memory():
+    """Her prompt with the notes she has been asked to keep, and the file's mtime so a
+    hand-edit can be noticed later. A module function, not a method, so the
+    stand-in objects the older tests use are not required to grow new attributes."""
+    stamp = memory.mtime()
+    try:
+        block = memory.render_block(memory.load(), persona.USER_NAME)
+    except memory.MemoryFileError:
+        log.warning("could not read the memory file; starting without it", exc_info=True)
+        block = ""
+    prompt = persona.build_system_prompt(flirt=FLIRT, memory=block).replace(persona.USER_NAME, USER_NAME)
+    return prompt, stamp
+
+
+def _refresh_memory_for(window, force=False):
+    """Rebuild her prompt if the notes changed (a note was kept or forgotten, or the
+    file was edited by hand). The notes are part of the system prompt, which comes out
+    of the room left for the conversation, so the history budget is recomputed too.
+
+    A no-op on an object that never loaded memory, which is what keeps the older
+    stand-in windows in the tests working unchanged. Never raises: a failed refresh
+    must not break a turn.
+    """
+    if getattr(window, "_memory_mtime", None) is None:
+        return
+    try:
+        if not force and memory.mtime() == window._memory_mtime:
+            return
+        prompt, stamp = _system_prompt_with_memory()
+        window._memory_mtime = stamp
+        if window.messages and window.messages[0].get("role") == "system":
+            window.messages[0]["content"] = prompt
+        window._history_budget = context_budget.history_budget(
+            persona.LLM_OPTIONS["num_ctx"], prompt, tools.TOOL_SCHEMAS)
+    except Exception:
+        log.exception("could not refresh her memory")
+
+
+def _remember_on_request(window, text):
+    """If `text` is "remember that ...", keep it (after his click) and return what to say.
+
+    Done in code because the model does not: asked outright, it said "Noted. I will keep it in
+    mind" and called no tool, 5 times in 5 (measured), which is a promise that is false the moment
+    the window closes. The note is his own words, so standing preferences are allowed; the click,
+    the secret check and the approval-bypass check still apply. Returns None if `text` is not that.
+    """
+    note = memory.remember_request(text)
+    if not note:
+        return None
+    result = tools.remember(note, "you asked her to remember it", trusted=True)
+    status = result.get("status")
+    if status == "remembered":
+        reply = "Kept."
+    elif status == "already known":
+        reply = "I already had that."
+    elif status == "declined":
+        reply = "Understood. I will not keep it."
+    else:
+        reply = result.get("error") or "I could not keep that."
+    # The exchange is part of the conversation: "what did I just ask you to remember?" works.
+    window.messages.append({"role": "user", "content": text})
+    window.messages.append({"role": "assistant", "content": reply})
+    return reply
+
+
+def _honour_promise(window, user_text, reply):
+    """If her reply promises to remember something and she did not actually call remember, make
+    the promise true by asking (a click, as always), or correct it. See memory.promises_to_remember
+    for why. Returns the reply, with the real outcome added when this fired.
+    """
+    if not reply or not memory.promises_to_remember(reply) or tools.remember_was_called():
+        return reply
+    note = memory.statement_about_him(user_text)
+    if not note:
+        return reply            # "Noted" about a command or a question: nothing to keep
+    result = tools.remember(note, "She said she would keep this in mind.", trusted=True)
+    status = result.get("status")
+    if status == "remembered":
+        said = "I have kept that."
+    elif status == "already known":
+        said = "I already had that."
+    elif status == "declined":
+        said = "I have not kept it."
+    else:
+        said = result.get("error") or "I could not keep that."
+    if window.messages and window.messages[-1].get("role") == "assistant":
+        window.messages[-1]["content"] = (window.messages[-1].get("content") or "") + " " + said
+    return reply.rstrip() + " " + said
+
+
 NOTHING_LEFT = "That was all of it."
 
 
@@ -708,13 +799,15 @@ class AstridWindow(Gtk.ApplicationWindow):
         tools.set_heartbeat_handler(self.heartbeat.beat)
         self._wake_thread = None
         self._wake_generation = 0
-        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        # Tokens left for history plus the current turn once the system prompt,
-        # tool schemas and a reply reserve are subtracted. History used to be
-        # limited by message COUNT only, so one big paste could push the system
-        # prompt out of the model's context. See context_budget.py.
+        prompt, self._memory_mtime = _system_prompt_with_memory()
+        self.messages = [{"role": "system", "content": prompt}]
+        # Tokens left for history plus the current turn once the system prompt (now
+        # including her notes), tool schemas and a reply reserve are subtracted.
+        # History used to be limited by message COUNT only, so one big paste could
+        # push the system prompt out of the model's context. See context_budget.py.
         self._history_budget = context_budget.history_budget(
-            persona.LLM_OPTIONS["num_ctx"], SYSTEM_PROMPT, tools.TOOL_SCHEMAS)
+            persona.LLM_OPTIONS["num_ctx"], prompt, tools.TOOL_SCHEMAS)
+        tools.set_memory_changed_handler(lambda: _refresh_memory_for(self, force=True))
         self._speak_typed = os.path.exists(SPEAK_TYPED_FILE)
         os.makedirs(GENERATED_DIR, exist_ok=True)
         os.chmod(auth.ASTRID_HOME, 0o700)
@@ -1064,6 +1157,16 @@ class AstridWindow(Gtk.ApplicationWindow):
             self.cancel_event.clear()
             self._speak(again, full=True, remember=False)
             return
+        if not paths and memory.remember_request(text):
+            self.cancel_event.clear()
+            said = _remember_on_request(self, text)
+            GLib.idle_add(self.append_transcript, ASSISTANT_NAME, said)
+            if self._speak_typed:
+                self.heartbeat.beat("speaking")
+                self._speak(said, full=True, remember=False)
+            else:
+                GLib.idle_add(self._set_state, STATE_IDLE)
+            return
         self._full_next_reply = speech.mentions_reading_aloud(text)
         loaded, problems = [], []
         for path in paths:
@@ -1096,6 +1199,8 @@ class AstridWindow(Gtk.ApplicationWindow):
         if reply is None:
             GLib.idle_add(self._set_state, STATE_IDLE)
             return
+        if not paths:
+            reply = _honour_promise(self, text, reply)
         GLib.idle_add(self.append_transcript, ASSISTANT_NAME, reply)
         if self._speak_typed or getattr(self, "_full_next_reply", False):
             self.heartbeat.beat("speaking")
@@ -1372,6 +1477,14 @@ class AstridWindow(Gtk.ApplicationWindow):
             self.heartbeat.beat("speaking")
             self._speak(again, full=True, remember=False)
             return True
+        if memory.remember_request(text):
+            self.cancel_event.clear()
+            self.heartbeat.beat("waiting for approval")
+            said = _remember_on_request(self, text)
+            GLib.idle_add(self.append_transcript, ASSISTANT_NAME, said)
+            self.heartbeat.beat("speaking")
+            self._speak(said, full=True, remember=False)
+            return True
         self._full_next_reply = speech.mentions_reading_aloud(text)
         self.cancel_event.clear()
         self.heartbeat.beat("waiting on the model")
@@ -1380,6 +1493,7 @@ class AstridWindow(Gtk.ApplicationWindow):
             # Cancelled mid-processing -- unwind quietly, no spoken reply.
             GLib.idle_add(self._set_state, STATE_IDLE)
             return False
+        reply = _honour_promise(self, text, reply)
         GLib.idle_add(self.append_transcript, ASSISTANT_NAME, reply)
         self.heartbeat.beat("speaking")
         self._speak(reply)
@@ -1451,6 +1565,7 @@ class AstridWindow(Gtk.ApplicationWindow):
 
     def _chat_with_tools(self, user_text):
         """Returns the reply text, or None if cancelled partway through."""
+        _refresh_memory_for(self)        # picks up a hand-edit of the notes, for one stat()
         self.messages.append({"role": "user", "content": user_text})
         # Trim BEFORE the call as well as after: this turn may be large.
         self._trim_history()
