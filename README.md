@@ -33,11 +33,17 @@ typed messages are off by default, with a switch.
 
 While she works the status line says what she is doing ("READING app.log...",
 "WAITING FOR YOUR APPROVAL...") with a seconds count, so a slow step looks
-different from a hung one. Replies are spoken a sentence at a time, so the first
-sound does not wait for the whole reply to be synthesized, and a long reply is
-spoken only as far as its first few sentences, with a closing line saying the
-rest is on screen. The thresholds are named constants at the top of `speech.py`;
-setting `SPOKEN_LIMIT_CHARS = 0` speaks everything.
+different from a hung one.
+
+She speaks for as long as an answer needs. Replies are spoken a sentence at a
+time, so the first sound does not wait for the whole reply to be synthesized.
+Click the orb, or press Stop, to break in at any point; then speak or type. Say
+"go on" to resume from the start of the sentence she was in, "read the rest" for
+whatever was left, or "read it all" to hear the last reply again. Those requests
+are answered from what she already said, not by the language model, which cannot
+be trusted to read its own earlier reply back. To cut long replies instead, set
+`SPOKEN_LIMIT_CHARS` in `speech.py` (for example 280): she then speaks the first
+few sentences and says the rest is on screen.
 
 ## Safety model
 

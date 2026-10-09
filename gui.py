@@ -565,6 +565,31 @@ class _PwRecordStream:
         return False
 
 
+NOTHING_LEFT = "That was all of it."
+
+
+def _earlier_reply_to_read_for(window, text):
+    """What to read out if `text` is just a request to read out what she said.
+
+    "the rest" is what was cut off by the length limit or left unsaid when she was
+    stopped. "go on" is the same when there is some, and ordinary conversation when
+    there is not ("go on" after a finished answer means elaborate, for the model).
+    "read the rest" with nothing left gets a short spoken answer instead of the
+    model, which would invent a rest.
+    """
+    wanted = speech.read_request(text)
+    remaining = getattr(window, "_last_rest", "")
+    if wanted == "rest":
+        if remaining:
+            return remaining
+        return NOTHING_LEFT if getattr(window, "_last_full", "") else ""
+    if wanted == "more":
+        return remaining
+    if wanted == "all":
+        return getattr(window, "_last_full", "")
+    return ""
+
+
 class _PwPlayStream:
     """Speech playback as ONE pw-play subprocess for a whole reply.
 
@@ -1033,6 +1058,13 @@ class AstridWindow(Gtk.ApplicationWindow):
     def _typed_turn(self, text, paths):
         self.heartbeat.beat("preparing a typed message")
         tools.begin_turn()
+        again = None if paths else _earlier_reply_to_read_for(self, text)
+        if again:
+            # Asked for in words, so it is spoken even with the typed-replies switch off.
+            self.cancel_event.clear()
+            self._speak(again, full=True, remember=False)
+            return
+        self._full_next_reply = speech.mentions_reading_aloud(text)
         loaded, problems = [], []
         for path in paths:
             try:
@@ -1065,7 +1097,7 @@ class AstridWindow(Gtk.ApplicationWindow):
             GLib.idle_add(self._set_state, STATE_IDLE)
             return
         GLib.idle_add(self.append_transcript, ASSISTANT_NAME, reply)
-        if self._speak_typed:
+        if self._speak_typed or getattr(self, "_full_next_reply", False):
             self.heartbeat.beat("speaking")
             self._speak(reply)
         else:
@@ -1332,6 +1364,15 @@ class AstridWindow(Gtk.ApplicationWindow):
         if text.strip().lower() in ("quit", "exit"):
             GLib.idle_add(self.get_application).quit()
             return False
+        # "Read the rest" / "read it out": answered from what she already said, not
+        # by the model, which writes new text instead of reading the old (measured).
+        again = _earlier_reply_to_read_for(self, text)
+        if again:
+            self.cancel_event.clear()
+            self.heartbeat.beat("speaking")
+            self._speak(again, full=True, remember=False)
+            return True
+        self._full_next_reply = speech.mentions_reading_aloud(text)
         self.cancel_event.clear()
         self.heartbeat.beat("waiting on the model")
         reply = self._chat_with_tools(text)
@@ -1605,14 +1646,21 @@ class AstridWindow(Gtk.ApplicationWindow):
     def _pcm(samples):
         return (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes()
 
-    def _speak(self, text):
+    def _speak(self, text, full=None, remember=True):
         """Say a reply aloud; returns only when playback is over.
+
+        `full` speaks all of it instead of the first few sentences. None means
+        "as the listener asked for this reply" (_full_next_reply, set when the
+        request said "out loud" or "read it"), consumed here so it covers one
+        reply only. `remember` records what was said so "read the rest" can find
+        it; the rereading itself passes False so it does not overwrite its source.
 
         The reply is cut into chunks (speech.plan_speech), the FIRST is
         synthesized here and starts playing at once, and a second thread
         synthesizes the rest while it plays. Kokoro runs about 8x faster than
-        real time, so after the first chunk it stays comfortably ahead. A long
-        reply is also shortened to its first few sentences plus a closing line;
+        real time, so after the first chunk it stays comfortably ahead. If the
+        length limit is switched on (speech.SPOKEN_LIMIT_CHARS, off by default) a
+        long reply is shortened to its first few sentences plus a closing line;
         the transcript already holds the full text.
 
         Thread layout: this thread synthesizes chunk 1, then only watches (stop,
@@ -1621,7 +1669,15 @@ class AstridWindow(Gtk.ApplicationWindow):
         """
         self.heartbeat.beat("synthesising speech")
         self._note_activity("PREPARING TO SPEAK...")
-        pieces = speech.plan_speech(clean_for_speech(text)).spoken
+        cleaned = clean_for_speech(text)
+        if full is None:
+            full = getattr(self, "_full_next_reply", False)
+            self._full_next_reply = False
+        plan = speech.plan_speech(cleaned, full=full)
+        if remember:
+            self._last_full = cleaned
+        self._last_rest = plan.rest
+        pieces = plan.spoken
         if not pieces:
             GLib.idle_add(self._set_state, STATE_IDLE)
             return
@@ -1645,6 +1701,7 @@ class AstridWindow(Gtk.ApplicationWindow):
         audio.put(self._pcm(first))
         abort = threading.Event()
         produced = {"seconds": len(first) / sr}   # audio synthesized so far
+        durations = [len(first) / sr]             # per piece, so a stop can be placed in the text
 
         def produce():
             try:
@@ -1659,6 +1716,7 @@ class AstridWindow(Gtk.ApplicationWindow):
                     envelope.add(samples)
                     self.core.envelope = envelope.snapshot()
                     produced["seconds"] += len(samples) / sr
+                    durations.append(len(samples) / sr)
                     audio.put(self._pcm(samples))
             except Exception:
                 log.exception("speech synthesis failed part-way; speaking what was ready")
@@ -1693,14 +1751,17 @@ class AstridWindow(Gtk.ApplicationWindow):
         # from audio actually produced, so a wedged synthesis ends playback 30 s
         # after the last sound instead of holding the wake loop forever.
         started = time.monotonic()
+        ended = "done"
         while True:
             if self.stop_speaking.is_set() or self.cancel_event.is_set():
+                ended = "stopped"
                 player.stop()
                 break
             if not player.running():
                 break                              # drained and exited, or died
             if time.monotonic() > started + produced["seconds"] + SPEAK_GRACE_SECONDS:
                 log.warning("speech overran %.1fs of audio; stopping", produced["seconds"])
+                ended = "stopped"
                 player.stop()
                 break
             self.heartbeat.beat("speaking")
@@ -1710,6 +1771,11 @@ class AstridWindow(Gtk.ApplicationWindow):
         # waiting would delay listening by a second or two after a barge-in.
         # TTS_LOCK makes the next reply queue behind it instead of overlapping.
         abort.set()
+        if ended == "stopped":
+            # Where in the reply she was stopped, so "go on" can pick up from the
+            # sentence she was in. Plus whatever the length limit had already held back.
+            left = speech.text_after(plan.chunks, list(durations), time.time() - self.core.playback_start)
+            self._last_rest = (left + " " + plan.rest).strip()
         player.close()
         feeder.join(1.0)
         self.core.envelope = None
