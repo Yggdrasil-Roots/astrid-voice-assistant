@@ -464,7 +464,7 @@ class _PwRecordStream:
 
     def __enter__(self):
         self.proc = subprocess.Popen(
-            ["pw-record", "--rate", str(self.rate), "--channels", "1",
+            ["pw-record", "--raw", "--rate", str(self.rate), "--channels", "1",
              "--format", "s16", "--latency", "%dms" % self.latency_ms, "-"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL, bufsize=0)
