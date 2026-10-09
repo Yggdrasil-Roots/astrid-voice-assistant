@@ -19,13 +19,13 @@ stability.cap_native_thread_pools(8)
 
 import atexit
 import collections
-import io
+import functools
 import subprocess
-import wave
 import signal
 import sys
 import json
 import math
+import queue
 import re
 import threading
 import time
@@ -44,9 +44,13 @@ from kokoro_onnx import Kokoro
 
 import pwd
 
+import attachments as attach_mod
 import auth
+import context_budget
 import image_gen
+import inputbar
 import persona
+import speech
 import tools
 
 ASTRID_INSTALL_DIR = "/opt/astrid"
@@ -126,6 +130,46 @@ MAX_TOOL_ITERATIONS = 6
 # no. Long enough to read an unfamiliar command properly; short enough that
 # walking away from the machine cannot park the wake-loop thread.
 COMMAND_CONFIRM_TIMEOUT_SECONDS = 120
+# Typed input. Spoken replies to typed messages are off unless this file exists
+# (the same per-user flag idiom as ~/.astrid/flirt); the window's switch makes it.
+SPEAK_TYPED_FILE = os.path.join(auth.ASTRID_HOME, "speak_typed")
+# Largest share of the context budget one typed message (text plus attachments)
+# may take. Older turns are dropped to leave room for the rest.
+MAX_MESSAGE_BUDGET_SHARE = 0.6
+# One conversational turn at a time, spoken or typed. Module level (there is one
+# window per process) so the wake loop and the typed-turn thread contend on the
+# same lock without either needing a new instance attribute.
+TURN_LOCK = threading.Lock()
+# Speech synthesis is not thread-safe (espeak-ng, behind Kokoro's phonemiser, keeps
+# global state) and a reply is synthesized chunk by chunk on a second thread. Every
+# tts.create() call goes through this lock, so two can never overlap -- including a
+# straggler left over from a reply that was interrupted, and the next reply's first
+# chunk. Module level for the same reason as TURN_LOCK.
+TTS_LOCK = threading.Lock()
+# How far past the audio produced so far playback may run before it is cut off.
+SPEAK_GRACE_SECONDS = 30.0
+
+
+def player_argv(sample_rate):
+    """The pw-play command for raw 16-bit mono audio on stdin. One place, so a
+    test can swap in a recorder. Raw means no header, which is what lets chunks
+    be appended to one running stream without a process start in between."""
+    return ["pw-play", "--raw", "--rate", str(sample_rate), "--channels", "1",
+            "--format", "s16", "-"]
+
+
+def _one_turn_at_a_time(method):
+    """Run `method` only if no other turn is in progress; otherwise drop it."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if not TURN_LOCK.acquire(blocking=False):
+            log.info("%s dropped: another turn is in progress", method.__name__)
+            return False
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            TURN_LOCK.release()
+    return wrapper
 
 RUNES = "ᚠᚢᚦᚨᚱᚲᚷᚹᚺᚾᛁᛃᛇᛈᛉᛊᛏᛒᛖᛗᛚᛜᛞᛟ"
 
@@ -153,6 +197,10 @@ STATUS_TEXT = {
     STATE_SPEAKING: "SPEAKING...",
     STATE_IMAGINING: "CONJURING AN IMAGE...",
 }
+
+# States in which she is busy on a turn: the status line shows what she is doing
+# and counts the seconds, instead of one unchanging word.
+WORKING_STATES = (STATE_THINKING, STATE_IMAGINING)
 
 GENERATED_DIR = os.path.join(auth.ASTRID_HOME, "generated")
 
@@ -517,10 +565,98 @@ class _PwRecordStream:
         return False
 
 
+class _PwPlayStream:
+    """Speech playback as ONE pw-play subprocess for a whole reply.
+
+    The reason playback is a subprocess at all: PortAudio segfaulted ten times in
+    libasound, and a child process owning the device leaves no C state in this
+    process to corrupt. Stop and barge-in are terminate(); there is no callback
+    to race. That is kept exactly. What is new is that audio arrives in pieces
+    while the reply is still being synthesized, so this is a stream you write to
+    rather than a file handed over whole.
+
+    write() blocks at the pipe's capacity (pw-play reads at playback rate), so it
+    belongs on its own thread and never on the one that must notice a barge-in.
+    """
+
+    def __init__(self, sample_rate):
+        self.proc = subprocess.Popen(
+            player_argv(sample_rate), stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def write(self, data):
+        self.proc.stdin.write(data)
+        self.proc.stdin.flush()
+
+    def end_input(self):
+        """EOF: pw-play finishes what it has been given, then exits."""
+        try:
+            self.proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def running(self):
+        return self.proc.poll() is None
+
+    def stop(self):
+        try:
+            self.proc.terminate()
+        except OSError:
+            pass
+
+    def close(self):
+        """Make sure it is gone. Terminates first if it is still alive, so a
+        writer blocked on a full pipe is released before stdin is closed."""
+        if self.running():
+            self.stop()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        self.end_input()
+
+
+class _Envelope:
+    """The loudness curve the orb follows, built up as chunks are synthesized.
+
+    Chunks play back to back, so their curves join end to end. Any samples left
+    over after the last whole block are carried into the next chunk, so the join
+    never drifts: block i always means the same 1/30 s of the stream.
+    """
+
+    def __init__(self, sample_rate):
+        self.block = max(1, sample_rate // 30)
+        self.rate = sample_rate / self.block
+        self._levels = np.zeros(0, dtype=np.float32)
+        self._carry = np.zeros(0, dtype=np.float32)
+
+    def add(self, samples):
+        data = np.concatenate([self._carry, np.asarray(samples, dtype=np.float32)])
+        whole = len(data) // self.block
+        if whole:
+            blocks = data[:whole * self.block].reshape(whole, self.block)
+            self._levels = np.concatenate(
+                [self._levels, np.sqrt(np.mean(np.square(blocks), axis=1))])
+        self._carry = data[whole * self.block:]
+
+    def snapshot(self):
+        """The curve so far, scaled so its loudest point is 1. A fresh array each
+        time: the GTK thread reads whichever one it was last handed."""
+        levels = self._levels
+        if len(self._carry):
+            levels = np.append(levels, rms_level(self._carry))
+        peak = float(levels.max()) if len(levels) else 0.0
+        return np.clip(levels / peak, 0.0, 1.0).astype(np.float32) if peak > 0 else levels.copy()
+
+
 class AstridWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title=ASSISTANT_NAME)
-        self.set_default_size(460, 720)
+        self.set_default_size(460, 800)
 
         self.stt = None
         self.tts = None
@@ -548,6 +684,13 @@ class AstridWindow(Gtk.ApplicationWindow):
         self._wake_thread = None
         self._wake_generation = 0
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Tokens left for history plus the current turn once the system prompt,
+        # tool schemas and a reply reserve are subtracted. History used to be
+        # limited by message COUNT only, so one big paste could push the system
+        # prompt out of the model's context. See context_budget.py.
+        self._history_budget = context_budget.history_budget(
+            persona.LLM_OPTIONS["num_ctx"], SYSTEM_PROMPT, tools.TOOL_SCHEMAS)
+        self._speak_typed = os.path.exists(SPEAK_TYPED_FILE)
         os.makedirs(GENERATED_DIR, exist_ok=True)
         os.chmod(auth.ASTRID_HOME, 0o700)
         os.chmod(GENERATED_DIR, 0o700)
@@ -621,6 +764,17 @@ class AstridWindow(Gtk.ApplicationWindow):
         scroller.set_child(self.transcript_view)
         root.append(scroller)
 
+        self.input_bar = inputbar.InputBar(
+            on_submit=self._on_submit_text,
+            on_stop=self._on_stop_turn,
+            on_attach_paths=self._request_attach,
+            on_speak_toggled=self._on_speak_toggled,
+            speak_active=os.path.exists(SPEAK_TYPED_FILE),
+        )
+        root.append(self.input_bar)
+        # A drop works anywhere on the window, not only over the bar.
+        self.add_controller(self.input_bar.make_drop_target())
+
         return root
 
     # -- lock screen ------------------------------------------------------
@@ -633,6 +787,7 @@ class AstridWindow(Gtk.ApplicationWindow):
         if self.locked:
             return False
         self.locked = True
+        self._sync_input_state(self.core.state)
         self.cancel_event.set()
         # Flag only. This runs on the GTK main thread (screensaver D-Bus
         # signal -> GLib.idle_add), and calling into ALSA from here while the
@@ -652,6 +807,7 @@ class AstridWindow(Gtk.ApplicationWindow):
         """Screen unlocked: resume. No PIN -- the OS session is the gate."""
         self.locked = False
         self.cancel_event.clear()
+        self._sync_input_state(self.core.state)
         return False
 
     def _watch_screensaver(self):
@@ -703,10 +859,52 @@ class AstridWindow(Gtk.ApplicationWindow):
         self._start_wake_loop(conversing=True)
 
     # -- UI helpers -------------------------------------------------------
+    # What she is doing right now, shown on the status line while she works. Class
+    # defaults so nothing depends on __init__ having run first.
+    _activity = None
+    _turn_started = 0.0
+    _status_timer = None
+
     def _set_state(self, state):
+        previous = self.core.state
         self.core.set_state(state)
-        self.status_label.set_text(STATUS_TEXT[state])
+        if state not in WORKING_STATES:
+            self._activity = None
+        elif previous not in WORKING_STATES:
+            self._turn_started = time.monotonic()
+        self._refresh_status()
+        if state in WORKING_STATES and self._status_timer is None:
+            self._status_timer = GLib.timeout_add(1000, self._tick_status)
+        self._sync_input_state(state)
         return False
+
+    def _note_activity(self, text):
+        """Say what she is doing on the status line. Safe from any thread."""
+        self._activity = text
+        GLib.idle_add(self._refresh_status)
+
+    def _status_text(self):
+        state = self.core.state
+        text = STATUS_TEXT[state]
+        if state in WORKING_STATES:
+            text = self._activity or text
+            waited = int(time.monotonic() - self._turn_started)
+            if waited >= 3:
+                # A ticking count is what tells you she is still alive during a
+                # slow step, which a static "THINKING..." never could.
+                text = "%s  %ds" % (text, waited)
+        return text
+
+    def _refresh_status(self):
+        self.status_label.set_text(self._status_text())
+        return False
+
+    def _tick_status(self):
+        if self.core.state not in WORKING_STATES:
+            self._status_timer = None
+            return False
+        self._refresh_status()
+        return True
 
     def append_transcript(self, speaker, text):
         end = self.transcript_buf.get_end_iter()
@@ -714,6 +912,164 @@ class AstridWindow(Gtk.ApplicationWindow):
         mark = self.transcript_buf.create_mark(None, self.transcript_buf.get_end_iter(), False)
         self.transcript_view.scroll_to_mark(mark, 0.0, False, 0, 0)
         return False
+
+    # -- typed input ----------------------------------------------------------
+    def _sync_input_state(self, state):
+        """Keep the input bar's enabled and Send/Stop state in step with the
+        window state. Main thread only."""
+        bar = getattr(self, "input_bar", None)
+        if bar is None:
+            return False
+        bar.set_busy(state in (STATE_THINKING, STATE_SPEAKING, STATE_IMAGINING))
+        bar.set_enabled(state in (STATE_IDLE, STATE_LISTENING) and not self.locked)
+        return False
+
+    def _on_speak_toggled(self, active):
+        self._speak_typed = bool(active)
+        try:
+            if active:
+                with open(SPEAK_TYPED_FILE, "a"):
+                    pass
+                os.chmod(SPEAK_TYPED_FILE, 0o600)
+            elif os.path.exists(SPEAK_TYPED_FILE):
+                os.remove(SPEAK_TYPED_FILE)
+        except OSError:
+            log.exception("could not save the spoken-replies setting")
+
+    def _on_stop_turn(self):
+        """Stop pressed: cancel thinking and cut speech. These are the same flags
+        a screen lock uses, so every thread unwinds the way it already does."""
+        self.cancel_event.set()
+        self.stop_speaking.set()
+
+    def _request_attach(self, paths):
+        self._attach_next(list(paths))
+
+    def _attach_next(self, queue):
+        """Validate and add files one at a time, pausing to ask about any that
+        look private. Main thread only."""
+        while queue:
+            path = queue.pop(0)
+            try:
+                attach_mod.open_regular(path).close()
+            except attach_mod.AttachmentError as exc:
+                self.input_bar.show_status(
+                    "%s: %s" % (attach_mod.display_name(path), exc), error=True)
+                continue
+            marker = attach_mod.sensitive_match(path)
+            if marker is None:
+                self.input_bar.add_attachment(path)
+                continue
+            self._confirm_sensitive_attach(path, marker, queue)
+            return          # resumes from the dialog's callback
+
+    def _confirm_sensitive_attach(self, path, marker, queue):
+        dialog = Gtk.AlertDialog()
+        dialog.set_modal(True)
+        dialog.set_message("Attach a file that looks private?")
+        dialog.set_detail(
+            "%s\n\nIts path matches '%s', so it may hold keys, passwords or other "
+            "credentials. Its text would be shown to the assistant and could appear "
+            "in the conversation. Attach it anyway?"
+            % (attach_mod.display_name(path), marker))
+        dialog.set_buttons(["Cancel", "Attach"])
+        dialog.set_cancel_button(0)
+        dialog.set_default_button(0)         # Enter cancels; attaching is deliberate
+
+        def answered(dlg, result):
+            try:
+                approved = dlg.choose_finish(result) == 1
+            except Exception:
+                approved = False
+            if approved:
+                self.input_bar.add_attachment(path)
+            self._attach_next(queue)
+
+        dialog.choose(self, None, answered)
+
+    def _on_submit_text(self, text, paths):
+        """Send pressed (main thread). The message appears at once; the work runs
+        on a thread so reading a PDF or waiting on the model never freezes the
+        window."""
+        if self.locked:
+            return
+        self.cancel_event.clear()
+        shown = text.strip()
+        if paths:
+            names = ", ".join(attach_mod.display_name(p) for p in paths)
+            shown = (shown + "\n" if shown else "") + "[attached: %s]" % names
+        self.append_transcript("You", shown)
+        self.input_bar.clear()
+        self._set_state(STATE_THINKING)      # also ends any microphone capture
+        threading.Thread(target=self._run_text_turn, args=(text, list(paths)),
+                         daemon=True, name="typed-turn").start()
+
+    def _restore_submission(self, text, paths, status):
+        """Put an unsent message back in the box so nothing the owner typed or
+        pasted is lost. Main thread only."""
+        self.input_bar.set_text(text)
+        for path in paths:
+            self.input_bar.add_attachment(path)
+        if status:
+            self.input_bar.show_status(status, error=True)
+        return False
+
+    def _run_text_turn(self, text, paths):
+        if not TURN_LOCK.acquire(blocking=False):
+            log.info("typed turn refused: another turn is in progress")
+            GLib.idle_add(self._restore_submission, text, paths,
+                          "She is busy. Try again in a moment.")
+            return
+        try:
+            self._typed_turn(text, paths)
+        except Exception:
+            log.exception("typed turn failed")
+            GLib.idle_add(self.append_transcript, ASSISTANT_NAME,
+                          "Something went wrong with that message.")
+            GLib.idle_add(self._set_state, STATE_IDLE)
+        finally:
+            TURN_LOCK.release()
+
+    def _typed_turn(self, text, paths):
+        self.heartbeat.beat("preparing a typed message")
+        tools.begin_turn()
+        loaded, problems = [], []
+        for path in paths:
+            try:
+                loaded.append(attach_mod.load_attachment(path))
+            except attach_mod.AttachmentError as exc:
+                problems.append("%s: %s" % (attach_mod.display_name(path), exc))
+            self.heartbeat.beat("reading an attachment")
+        for problem in problems:
+            GLib.idle_add(self.append_transcript, "Note", "Could not attach " + problem)
+        if not loaded and not text.strip():
+            GLib.idle_add(self._restore_submission, text, paths, None)
+            GLib.idle_add(self._set_state, STATE_IDLE)
+            return
+        try:
+            built = attach_mod.build_fitted(
+                text, loaded, int(self._history_budget * MAX_MESSAGE_BUDGET_SHARE))
+        except attach_mod.AttachmentError as exc:
+            GLib.idle_add(self.append_transcript, "Note", str(exc))
+            GLib.idle_add(self._restore_submission, text, paths, None)
+            GLib.idle_add(self._set_state, STATE_IDLE)
+            return
+        for note in built.notes:
+            GLib.idle_add(self.append_transcript, "Note", note)
+        if loaded:
+            tools.note_content_ingested("an attached file")
+        self.cancel_event.clear()
+        self.heartbeat.beat("waiting on the model")
+        reply = self._chat_with_tools(built.message)
+        if reply is None:
+            GLib.idle_add(self._set_state, STATE_IDLE)
+            return
+        GLib.idle_add(self.append_transcript, ASSISTANT_NAME, reply)
+        if self._speak_typed:
+            self.heartbeat.beat("speaking")
+            self._speak(reply)
+        else:
+            GLib.idle_add(self._set_state, STATE_IDLE)
 
     # -- interaction --------------------------------------------------------
     def on_core_click(self, gesture, n_press, x, y):
@@ -888,7 +1244,9 @@ class AstridWindow(Gtk.ApplicationWindow):
         was_conversing = conversing
 
         if audio is None or len(audio) < SAMPLE_RATE * MIN_UTTERANCE_SECONDS:
-            if manual or was_conversing:
+            # A typed turn that preempted listening (it set THINKING, which ends the
+            # capture) must not have its state reset to IDLE underneath it.
+            if (manual or was_conversing) and not TURN_LOCK.locked():
                 GLib.idle_add(self._set_state, STATE_IDLE)
             return False
 
@@ -952,6 +1310,7 @@ class AstridWindow(Gtk.ApplicationWindow):
             return ""
         return text
 
+    @_one_turn_at_a_time
     def _process_audio(self, audio):
         """Returns True if this was a real turn she answered.
 
@@ -964,6 +1323,7 @@ class AstridWindow(Gtk.ApplicationWindow):
         """
         GLib.idle_add(self._set_state, STATE_THINKING)
         self.heartbeat.beat("transcribing")
+        tools.begin_turn()
         text = self._transcribe(audio)
         if not text:
             GLib.idle_add(self._set_state, STATE_IDLE)
@@ -1051,11 +1411,22 @@ class AstridWindow(Gtk.ApplicationWindow):
     def _chat_with_tools(self, user_text):
         """Returns the reply text, or None if cancelled partway through."""
         self.messages.append({"role": "user", "content": user_text})
-        reply = "Sorry, I couldn't finish that one."
+        # Trim BEFORE the call as well as after: this turn may be large.
+        self._trim_history()
+        # What this turn may still add, spent by tool results. Without it one big
+        # read pushes the prompt past num_ctx, and then Ollama keeps only the first
+        # few tokens and the tail ("truncating input prompt ... keep=4"): the
+        # system prompt is what gets cut. Measured 2026-10-09 with a 30 KB result:
+        # she lost her persona and every pass took seconds longer.
+        budget = context_budget.TurnBudget(
+            self._history_budget - context_budget.messages_tokens(self.messages[1:]))
+        reply = None
         try:
-            for _ in range(MAX_TOOL_ITERATIONS):
+            for step in range(MAX_TOOL_ITERATIONS):
                 if self.cancel_event.is_set():
                     return None
+                self._note_activity("THINKING..." if step == 0
+                                    else "READING WHAT IT FOUND...")
                 message = self._stream_chat()
                 if message is None:
                     return None
@@ -1064,11 +1435,13 @@ class AstridWindow(Gtk.ApplicationWindow):
                 if not calls:
                     reply = message.get("content", "").strip() or "..."
                     break
+                budget.charge(context_budget.message_tokens(message))
                 for call in calls:
                     if self.cancel_event.is_set():
                         return None
                     name = call["function"]["name"]
                     args = call["function"].get("arguments", {})
+                    self._note_activity(tools.describe_call(name, args))
                     if name == "generate_image":
                         try:
                             result = self._generate_image_tool(args.get("prompt", ""))
@@ -1076,20 +1449,26 @@ class AstridWindow(Gtk.ApplicationWindow):
                             return None
                     else:
                         result = tools.call_tool(name, args)
-                    self.messages.append({"role": "tool", "content": json.dumps(result)})
+                    budget.charge(context_budget.MESSAGE_OVERHEAD_TOKENS)
+                    self.messages.append({
+                        "role": "tool",
+                        "content": context_budget.clip_tool_result(result, budget)})
                 if self.cancel_event.is_set():
                     return None
-            else:
-                # Budget spent with every single pass coming back as another
-                # tool call. Instead of speaking the seed apology and binning
-                # everything gathered so far, take one more pass with the
-                # tools withheld so the model has to answer from the history
-                # it already built.
+                if budget.exhausted:
+                    break
+            if reply is None:
+                # Either every pass came back as another tool call, or the turn's
+                # token budget is spent. Instead of speaking a seed apology and
+                # binning everything gathered so far, take one more pass with the
+                # tools withheld so the model has to answer from the history it
+                # already built.
+                self._note_activity("PUTTING TOGETHER AN ANSWER...")
                 final = self._stream_chat(use_tools=False)
                 if final is None:
                     return None
                 self.messages.append(final)
-                reply = final.get("content", "").strip() or reply
+                reply = final.get("content", "").strip() or "Sorry, I couldn't finish that one."
         except requests.RequestException as e:
             reply = f"I couldn't reach the language model: {e}"
 
@@ -1097,20 +1476,21 @@ class AstridWindow(Gtk.ApplicationWindow):
         return reply
 
     def _trim_history(self):
-        # Keep the system prompt + most recent messages, cut only at a
-        # "user" boundary so a tool_calls message never gets orphaned
-        # from its tool result.
-        system = self.messages[0]
-        rest = self.messages[1:]
-        if len(rest) <= MAX_HISTORY_MESSAGES:
-            return
-        cut = len(rest) - MAX_HISTORY_MESSAGES
-        while cut < len(rest) and rest[cut].get("role") != "user":
-            cut += 1
-        self.messages = [system] + rest[cut:]
+        # Keep the system prompt and the most recent WHOLE turns, within both the
+        # message cap and the token budget (context_budget.py). Only whole turns
+        # are dropped, so a tool_calls message is never orphaned from its tool
+        # result, and the newest turn is always kept. The token cap is what stops
+        # one big upload or paste from pushing the system prompt out of context.
+        self.messages = context_budget.trim_to_budget(
+            self.messages, max_messages=MAX_HISTORY_MESSAGES,
+            max_tokens=self._history_budget)
 
-    def _confirm_command(self, command, reason=""):
+    def _confirm_command(self, command, reason="", title=None, approve="Run"):
         """Ask the user to approve a command. Returns True only on an explicit yes.
+
+        `title` and `approve` let the same dialog serve an edit ("Apply") or an
+        admin terminal ("Open terminal") without a second code path to get
+        wrong; Cancel is always the default button.
 
         Called from the wake-loop thread, so the dialog is built on the main
         thread via idle_add and the result comes back through an Event.
@@ -1137,10 +1517,10 @@ class AstridWindow(Gtk.ApplicationWindow):
             try:
                 dialog = Gtk.AlertDialog()
                 dialog.set_modal(True)
-                dialog.set_message("Astrid wants to run a command")
+                dialog.set_message(title or "Astrid wants to run a command")
                 detail = command if not reason else "%s\n\n%s" % (command, reason)
                 dialog.set_detail(detail)
-                dialog.set_buttons(["Cancel", "Run"])
+                dialog.set_buttons(["Cancel", approve])
                 dialog.set_cancel_button(0)
                 dialog.set_default_button(0)   # Enter cancels; Run is deliberate
 
@@ -1158,7 +1538,8 @@ class AstridWindow(Gtk.ApplicationWindow):
             return False
 
         GLib.idle_add(present)
-        log.info("awaiting approval for: %s", command)
+        self._note_activity("WAITING FOR YOUR APPROVAL...")
+        log.info("awaiting approval for: %s", command.splitlines()[0] if command else command)
 
         deadline = time.monotonic() + COMMAND_CONFIRM_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
@@ -1214,94 +1595,123 @@ class AstridWindow(Gtk.ApplicationWindow):
         GLib.idle_add(self._set_state, STATE_THINKING)
         return {"status": "image generated and now shown to the user", "prompt": prompt}
 
+    def _synthesize(self, piece):
+        """One chunk of speech -> (samples, sample rate), serialised by TTS_LOCK."""
+        with TTS_LOCK:
+            return self.tts.create(piece, voice=persona.TTS_VOICE,
+                                   speed=persona.TTS_SPEED, lang=persona.TTS_LANG)
+
     @staticmethod
-    def _feed_player(proc, payload):
-        """pw-play consumes stdin at playback rate, so this blocks for the
-        whole utterance and cannot live on the thread that must notice
-        barge-in."""
-        try:
-            proc.stdin.write(payload)
-            proc.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
-
-    def _play_pipewire(self, samples, sr):
-        """Play via pw-play instead of PortAudio.
-
-        All ten segfaults in this machine's logs share one signature:
-        libasound snd_pcm_poll_descriptors_revents, called from libportaudio.
-        sd.play() opens a fresh PortAudio stream per utterance through
-        pipewire's ALSA shim, and that open/close churn against a shim which
-        can reconfigure underneath is where it dies.
-
-        Handing the device to a subprocess retires the whole failure class.
-        The one-thread-owns-the-device invariant that stability.wait_for_playback
-        exists to protect has nothing left to protect: if the watchdog fires
-        mid-speech and starts a second wake loop -- which is what segfaulted on
-        2026-08-22 at 181s of legitimate speech -- there is no shared C state in
-        this process to corrupt. Barge-in becomes terminate(), which cannot
-        race a callback because there is no callback. Microphone capture now
-        goes the same way, via _PwRecordStream -- see that class for why it was
-        wrong to think capture was exempt.
-        """
-        wav = io.BytesIO()
-        with wave.open(wav, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(sr)
-            w.writeframes(
-                (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes())
-        payload = wav.getvalue()
-        expected = len(samples) / sr
-
-        try:
-            proc = subprocess.Popen(
-                ["pw-play", "-"], stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except OSError:
-            log.exception("pw-play unavailable; this reply is not spoken")
-            return
-
-        threading.Thread(target=self._feed_player, args=(proc, payload),
-                         daemon=True).start()
-
-        # Same bounded contract as stability.wait_for_playback: never block
-        # past a generous multiple of the real duration, and beat the heartbeat
-        # throughout so the watchdog does not mistake long speech for a hang.
-        deadline = time.time() + expected + 30.0
-        while proc.poll() is None:
-            if self.stop_speaking.is_set() or self.cancel_event.is_set():
-                proc.terminate()
-                break
-            if time.time() > deadline:
-                log.warning("pw-play overran expected %.1fs; terminating", expected)
-                proc.terminate()
-                break
-            self.heartbeat.beat("speaking")
-            time.sleep(0.05)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+    def _pcm(samples):
+        return (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes()
 
     def _speak(self, text):
+        """Say a reply aloud; returns only when playback is over.
+
+        The reply is cut into chunks (speech.plan_speech), the FIRST is
+        synthesized here and starts playing at once, and a second thread
+        synthesizes the rest while it plays. Kokoro runs about 8x faster than
+        real time, so after the first chunk it stays comfortably ahead. A long
+        reply is also shortened to its first few sentences plus a closing line;
+        the transcript already holds the full text.
+
+        Thread layout: this thread synthesizes chunk 1, then only watches (stop,
+        cancel, heartbeat, deadline) as before; `produce` synthesizes the rest;
+        `feed` writes to the one pw-play process, because that write blocks.
+        """
         self.heartbeat.beat("synthesising speech")
-        samples, sr = self.tts.create(
-            clean_for_speech(text),
-            voice=persona.TTS_VOICE, speed=persona.TTS_SPEED, lang=persona.TTS_LANG,
-        )
-        block = max(1, sr // 30)
-        blocks = [rms_level(samples[i:i + block]) for i in range(0, len(samples), block)]
-        env = np.array(blocks, dtype=np.float32)
-        peak = env.max() if len(env) else 0.0
-        if peak > 0:
-            env = env / peak
-        self.core.envelope = env
-        self.core.envelope_rate = sr / block
+        self._note_activity("PREPARING TO SPEAK...")
+        pieces = speech.plan_speech(clean_for_speech(text)).spoken
+        if not pieces:
+            GLib.idle_add(self._set_state, STATE_IDLE)
+            return
+        first, sr = self._synthesize(pieces[0])
+        try:
+            player = _PwPlayStream(sr)
+        except OSError:
+            log.exception("pw-play unavailable; this reply is not spoken")
+            GLib.idle_add(self._set_state, STATE_IDLE)
+            return
+
+        envelope = _Envelope(sr)
+        envelope.add(first)
+        self.core.envelope = envelope.snapshot()
+        self.core.envelope_rate = envelope.rate
         self.core.playback_start = time.time()
         self.stop_speaking.clear()
         GLib.idle_add(self._set_state, STATE_SPEAKING)
-        self._play_pipewire(samples, sr)
+
+        audio = queue.Queue()
+        audio.put(self._pcm(first))
+        abort = threading.Event()
+        produced = {"seconds": len(first) / sr}   # audio synthesized so far
+
+        def produce():
+            try:
+                for piece in pieces[1:]:
+                    if abort.is_set():
+                        return
+                    samples, rate = self._synthesize(piece)
+                    if abort.is_set():
+                        return
+                    if rate != sr:
+                        raise RuntimeError("sample rate changed mid-reply: %s -> %s" % (sr, rate))
+                    envelope.add(samples)
+                    self.core.envelope = envelope.snapshot()
+                    produced["seconds"] += len(samples) / sr
+                    audio.put(self._pcm(samples))
+            except Exception:
+                log.exception("speech synthesis failed part-way; speaking what was ready")
+            finally:
+                audio.put(None)                    # end of stream, however it ended
+
+        def feed():
+            try:
+                while not abort.is_set():
+                    try:
+                        data = audio.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    if data is None:
+                        break
+                    player.write(data)
+            except (BrokenPipeError, OSError, ValueError):
+                pass                               # the player went away: nothing to feed
+            finally:
+                player.end_input()
+
+        if len(pieces) > 1:
+            threading.Thread(target=produce, daemon=True, name="speech-synth").start()
+        else:
+            audio.put(None)
+        feeder = threading.Thread(target=feed, daemon=True, name="speech-feed")
+        feeder.start()
+
+        # The same bounded contract as before: never block past the audio that
+        # exists plus a generous margin, and beat the heartbeat throughout so the
+        # watchdog does not mistake long speech for a hang. The margin is measured
+        # from audio actually produced, so a wedged synthesis ends playback 30 s
+        # after the last sound instead of holding the wake loop forever.
+        started = time.monotonic()
+        while True:
+            if self.stop_speaking.is_set() or self.cancel_event.is_set():
+                player.stop()
+                break
+            if not player.running():
+                break                              # drained and exited, or died
+            if time.monotonic() > started + produced["seconds"] + SPEAK_GRACE_SECONDS:
+                log.warning("speech overran %.1fs of audio; stopping", produced["seconds"])
+                player.stop()
+                break
+            self.heartbeat.beat("speaking")
+            time.sleep(0.05)
+
+        # An in-flight synthesis is not waited for: it cannot be interrupted, and
+        # waiting would delay listening by a second or two after a barge-in.
+        # TTS_LOCK makes the next reply queue behind it instead of overlapping.
+        abort.set()
+        player.close()
+        feeder.join(1.0)
         self.core.envelope = None
         GLib.idle_add(self._set_state, STATE_IDLE)
 
@@ -1351,7 +1761,7 @@ class AstridApp(Gtk.Application):
 
     def do_activate(self):
         provider = Gtk.CssProvider()
-        provider.load_from_string(CSS)
+        provider.load_from_string(CSS + inputbar.CSS)
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
