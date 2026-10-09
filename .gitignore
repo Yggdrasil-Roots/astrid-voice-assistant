@@ -1,0 +1,13 @@
+# Runtime state, secrets, environments and weights never go in version control
+venv/
+models/
+*.onnx
+voices-*.bin
+*.npy
+*.bak
+*.bak.*
+*.orig*
+__pycache__/
+*.log
+.env
+pin
